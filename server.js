@@ -1,6 +1,6 @@
 const express = require('express');
 
-const AUTH_KEY = process.env.AUTH_KEY || "5ecde94e179c4ebfa0248b865391aca6a4b6e27cc7ee4fb0";
+const AUTH_KEY = process.env.AUTH_KEY || "کلید-امنیتی-شما";
 
 const SKIP_HEADERS = new Set([
   "host", "connection", "content-length", "transfer-encoding",
@@ -14,13 +14,23 @@ const DEFAULT_HEADERS = {
 };
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
 
+// ---------- مدیریت صحیح JSON ورودی ----------
+app.use(express.json({ limit: '50mb' })); // افزایش محدودیت حجم درخواست ورودی
+
+// اگر JSON نادرست باشد، به‌جای HTML خطای JSON برگردانیم
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({ e: "invalid json" });
+  }
+  next(err);
+});
+
+// ---------- مسیرها ----------
 app.get('/', (req, res) => {
-  res.send(`<!DOCTYPE html><html><head><title>My App</title></head>
+  res.send(`<!DOCTYPE html><html><head><title>Proxy</title></head>
     <body style="font-family:sans-serif;max-width:600px;margin:40px auto">
-    <h1>Welcome</h1><p>This application is running normally.</p>
-    </body></html>`);
+    <h1>Welcome</h1><p>Proxy is running.</p></body></html>`);
 });
 
 app.post('/', async (req, res) => {
@@ -31,15 +41,17 @@ app.post('/', async (req, res) => {
     }
 
     if (Array.isArray(body.q)) {
-      return handleBatch(body.q, res);
+      return await handleBatch(body.q, res);
     }
-    return handleSingle(body, res);
+    return await handleSingle(body, res);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ e: String(err) });
+    // گرفتن خطاهای ناخواسته و بازگرداندن JSON
+    console.error("Unhandled POST error:", err);
+    return res.status(500).json({ e: "internal error" });
   }
 });
 
+// ---------- درخواست تکی ----------
 async function handleSingle(req, res) {
   if (!req.u || typeof req.u !== 'string' || !/^https?:\/\//i.test(req.u)) {
     return res.status(400).json({ e: "bad url" });
@@ -48,13 +60,14 @@ async function handleSingle(req, res) {
     const opts = buildFetchOpts(req);
     const response = await fetch(req.u, opts);
     const result = await buildResult(response);
-    res.json(result);
+    return res.json(result);
   } catch (err) {
-    console.error(`Single fetch error: ${req.u}`, err.message);
-    res.status(502).json({ e: String(err) });
+    console.error(`Single fetch error for ${req.u}:`, err.message);
+    return res.status(502).json({ e: String(err.message || err) });
   }
 }
 
+// ---------- درخواست دسته‌ای ----------
 async function handleBatch(items, res) {
   const results = new Array(items.length);
   const errors = {};
@@ -65,7 +78,7 @@ async function handleBatch(items, res) {
     }
   }
 
-  const CONCURRENCY = 50;
+  const CONCURRENCY = 25; // کاهش همزمانی برای پایداری بیشتر
   for (let start = 0; start < items.length; start += CONCURRENCY) {
     const chunk = items.slice(start, start + CONCURRENCY);
     const promises = chunk.map(async (item, idx) => {
@@ -76,8 +89,8 @@ async function handleBatch(items, res) {
         const resp = await fetch(item.u, opts);
         return { idx: globalIdx, result: await buildResult(resp) };
       } catch (err) {
-        console.error(`Batch error: ${item.u}`, err.message);
-        return { idx: globalIdx, result: { e: String(err) } };
+        console.error(`Batch error for ${item.u}:`, err.message);
+        return { idx: globalIdx, result: { e: String(err.message || err) } };
       }
     });
     const chunkResults = await Promise.all(promises);
@@ -86,9 +99,10 @@ async function handleBatch(items, res) {
     }
   }
 
-  res.json({ q: results });
+  return res.json({ q: results });
 }
 
+// ---------- ساخت آپشن‌های fetch ----------
 function buildFetchOpts(req) {
   const opts = {
     method: (req.m || 'GET').toUpperCase(),
@@ -112,14 +126,18 @@ function buildFetchOpts(req) {
   return opts;
 }
 
+// ---------- تبدیل پاسخ به JSON (با مدیریت حجم بالا) ----------
 async function buildResult(response) {
-  const headers = {};
-  response.headers.forEach((value, key) => {
-    headers[key] = value;
-  });
-
-  const buffer = Buffer.from(await response.arrayBuffer());
+  // دریافت کامل بدنه (حتی اگر حجیم باشد)
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
   const base64Body = buffer.toString('base64');
+
+  // استخراج هدرها
+  const headers = {};
+  for (const [key, value] of response.headers.entries()) {
+    headers[key] = value;
+  }
 
   return {
     s: response.status,
@@ -127,6 +145,22 @@ async function buildResult(response) {
     b: base64Body,
   };
 }
+
+// ---------- مدیریت سراسری خطا (برای جلوگیری از ارسال HTML) ----------
+app.use((err, req, res, next) => {
+  console.error("Global error:", err);
+  res.status(500).json({ e: "server error" });
+});
+
+// ---------- گرفتن خطاهای بحرانی (Uncaught Exceptions) ----------
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  // سرور دوباره توسط Railway راه‌اندازی خواهد شد
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
